@@ -1,0 +1,455 @@
+
+
+import java.util
+
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
+import org.apache.spark.ml.feature.{StopWordsRemover, Word2Vec}
+import org.apache.spark.ml.clustering.KMeans
+import org.apache.spark.ml.evaluation.ClusteringEvaluator
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.functions.{col, udf}
+import com.huaban.analysis.jieba.{JiebaSegmenter, SegToken}
+import com.huaban.analysis.jieba.JiebaSegmenter.SegMode
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.functions._
+
+object GroupWork_2 {
+  def main(args: Array[String]): Unit = {
+
+    //conf 设置SparkApplication的名称和运行模式
+    val conf = new SparkConf()
+      .registerKryoClasses(Array(classOf[JiebaSegmenter]))
+      .set("spark.rpc.message.maxSize", "800")
+      .setMaster("local[*]")
+      .set("spark.executor.memory", "16g")
+      .set("spark.driver.memory", "16g")
+
+
+    val spark = SparkSession
+      .builder()
+      .master("local[*]")
+      .appName("Jieba UDF")
+      .enableHiveSupport()
+      .config(conf)
+      .getOrCreate()
+
+    import spark.implicits._
+
+
+    //读取数据集
+    val lines: DataFrame = spark.read.csv(args(0)).na.drop() //.cache()
+    //lines.show()
+
+    //构建SQL全局图用于执行SQL语句操作
+    lines.createOrReplaceTempView("TotalLines")
+
+
+    /*
+        英文部分处理
+     */
+
+    //tweet_language tag在state-backed是_c8，在normal是_c16
+    val EngLines: DataFrame = spark.sql("SELECT * FROM TotalLines WHERE _c16 = 'en'").na.drop() //.cache()
+    //val EngLines: DataFrame = spark.sql("SELECT * FROM TotalLines WHERE _c16 = 'en'").na.drop().cache()
+    //println("英文行数：")
+    //EngLines.show()
+    //    println(EngLines.count())
+
+    //state-backed _c9列是推文列,normal _c2是推文列
+    val linesrdd_en = EngLines.select("_c2").rdd //2.英文推文列
+
+    //state-backed_c9是推文列，_c10是时间列，normal _c2是推文列，_c1是推文时间列
+    val EngWordPlusTime = EngLines.select("_c2", "_c1")
+    //val EngWordPlusTime = EngLines.select("_c2", "_c1")
+
+    val LinesRDD_en = linesrdd_en.map(itr => {
+      itr.mkString
+    }).toDS() //英文推文RDD
+
+    println("英文原始推文：")
+    //LinesRDD_en.take(20).foreach(println)
+    //println("行数：")
+    //println(LinesRDD_en.count())
+
+    //英文remove stopwords try1:
+    //read stopwords.txt
+    val stopWordList = (spark.read.textFile("EngStopWords.txt")).rdd.collect().toList
+    println(stopWordList)
+
+    //select the last col，split，and remove stop words
+    val EngDF = LinesRDD_en.map(line => {
+      val splits = line.split(",").reverse(0)
+      val wd = splits.split(" +").filter(!stopWordList.contains(_))
+      (line, wd)
+    })
+    println("分词+去除停用词后的英文推文")
+    //EngDF.show(20,false)
+    println("分词完成")
+    //try1 finish
+    //Above OK
+
+
+    //将df转换成Word2Vector形式，输出最终用于kmeans的DF，每一句话转成一个三维向量
+    println("w2v-1")
+    val word2Vec = new Word2Vec().setInputCol("_2").setOutputCol("result").setVectorSize(5).setMinCount(0)
+    println("w2v-2")
+    val EngDFModel = word2Vec.fit(EngDF)
+    println("w2v-3")
+    val EngV2cDF = EngDFModel.transform(EngDF)
+    //    DF.select("result").take(1).foreach(println)
+    println("============================英文推文Word2Vec=================================")
+    //EngV2cDF.show(false)
+    println("============================英文推文Word2Vec Done=================================")
+
+    /*
+    中文部分处理
+     */
+
+
+    val ChinaLines: DataFrame = spark.sql("SELECT * FROM TotalLines WHERE _c16 = 'zh'")
+    println("============================中文原始数据=================================")
+    //ChinaLines.show()
+    println("============================中文原始推文列+时间列=================================")
+    val ChineseWordPlusTime = ChinaLines.select("_c2", "_c1")
+
+    //中文推文部分聚类处理
+    //_c9列是推文列
+    println("============================中文原始推文列=================================")
+    val linesrdd = ChinaLines.select("_c2").rdd
+    //try1
+    //linesrdd.take(5).foreach(println)
+    //dataframe转RDD，为后续去除单词间空格做准备
+    val LinesRDD = linesrdd.map(itr => {
+      itr.mkString
+    })
+    //try1
+    //LinesRDD.take(5).foreach(println)
+    //    LinesRDD.take(5).foreach(println)
+
+    //中文分词
+    println("============================中文分词=================================")
+    val LinesForChina = LinesRDD.map { x =>
+      var str = if (x.length > 0)
+        new JiebaSegmenter().sentenceProcess(x)
+      (x, str.toString)
+    }
+    LinesForChina.take(5).foreach(println)
+
+    println("============================读取中文常用词=================================")
+    //中文词去除常用词（待改）
+    val ChinaStopWords = (spark.read.textFile("ChineseWords.txt")).rdd.collect().toList
+
+    //    println(ChinaStopWords.contains("和"))
+    //LinesForChina.take(5).foreach(println)
+
+    println("============================中文去除常用词=================================")
+    val ChinaFiltered = LinesForChina.map(line => {
+      val splits = line._2.split("[,\\s]").toList
+      //      splits.foreach(itr=>{
+      //        println(itr.equals("和"))
+      //      })
+      splits.foreach(println)
+      val wd = splits.filter(!ChinaStopWords.contains(_))
+      (line._1, wd)
+    })
+    //        ChinaFiltered.take(2).foreach(_.foreach(print))
+
+    println("============================中文去除常用词存DF=================================")
+    val ChinaFiltered_DF: DataFrame = ChinaFiltered.toDF()
+    //ChinaFiltered_DF.show()
+    println("============================中文去除常用词的DF=================================")
+    //    val rows = ChinaFiltered_DF.take(2).foreach(println)
+    //val ChinaFiltered_DFF: DataFrame = ChinaFiltered_DF.sample(false,0.1,100)
+    //  .cache()
+    //ChinaFiltered_DFF.show()
+
+    //此步骤的问题就是太慢，所以先注释掉
+    //将df转换成Word2Vector形式，输出最终用于kmeans的DF，每一句话转成一个三维向量
+    println("============================中文w2c-1=================================")
+    val ChinaWord2Vec = new Word2Vec().setInputCol("_2").setOutputCol("result").setVectorSize(5).setMinCount(0)
+    println("============================中文w2c-2=================================")
+    val ChinaModel = ChinaWord2Vec.fit(ChinaFiltered_DF)
+    println("============================中文w2c-3=================================")
+    val ChinaDF = ChinaModel.transform(ChinaFiltered_DF)
+    //    DF.select("result").take(1).foreach(println)
+    println("============================中文w2c-4=================================")
+    //ChinaDF.show()
+    println("============================中文w2c-结果=================================")
+
+
+    //合并中英文转换成vector之后的数据集
+    println("============================合并中英文=================================")
+    val TotalDF = EngV2cDF.unionByName(ChinaDF)
+    //TotalDF.show()
+    println("============================合并中英文的数据集=================================")
+
+
+    //训练出最优的k
+    val TotalDDF = TotalDF.sample(false, 0.1, 100)
+    var MaxScore = 0.00
+    var BestK = 0
+
+    for (i <- (10 to 40).reverse) {
+      println("============================kmeans训练-1=================================")
+      val kmeanstrain = new KMeans()
+        .setK(i)
+        .setSeed(1L)
+        .setFeaturesCol("result")
+        .setPredictionCol("prediction")
+      println("============================kmeans训练-2=================================")
+      val model2 = kmeanstrain.fit(TotalDDF)
+      //      val centers = model2.clusterCenters
+      println("============================kmeans训练-3=================================")
+      val predictions = model2.transform(TotalDDF)
+      println("============================kmeans训练-4=================================")
+      predictions.show()
+      println("============================kmeans训练-结果=================================")
+
+      println("============================kmeans训练-评估=================================")
+      val evaluator = new ClusteringEvaluator()
+        .setFeaturesCol("result")
+        .setPredictionCol("prediction")
+        .setMetricName("silhouette")
+      val silhouette = evaluator.evaluate(predictions)
+      //      println("得分：" + silhouette)
+
+      println("============================kmeans训练-当前轮数=================================")
+      println(i)
+      println("============================kmeans训练-当前评分=================================")
+      println(silhouette)
+      println("============================kmeans训练-当前Bestkey=================================")
+      println(BestK)
+      println("============================kmeans训练-当前最高分=================================")
+      println(MaxScore)
+
+
+      if (silhouette > MaxScore) {
+        MaxScore = silhouette
+        BestK = i
+        println("============================kmeans训练-当前Bestkey=================================")
+        println(BestK)
+      }
+    }
+    println("============================kmeans训练出的Bestkey=================================")
+    println(BestK)
+
+
+    //使用BestK作为参数放在全数据集中运行
+    println("============================kmeans-1=================================")
+    val kmeans = new KMeans()
+      .setK(BestK)
+      .setSeed(1L)
+      .setFeaturesCol("result")
+      .setPredictionCol("prediction")
+
+    println("============================kmeans-2=================================")
+    val KModel = kmeans.fit(TotalDF)
+    //      val centers = model2.clusterCenters
+    println("============================kmeans-3=================================")
+    val predictions = KModel.transform(TotalDF).distinct()
+      .withColumnRenamed("_1", "Tweets")
+      .withColumnRenamed("_2", "FilteredWords")
+      .withColumnRenamed("result", "Vectors")
+      .withColumnRenamed("prediction", "Predictions")
+
+    println("============================kmeans-4=================================")
+    val predictions_1 = KModel.transform(TotalDF) //要改成DF
+      .withColumnRenamed("_1", "Tweets")
+      .withColumnRenamed("_2", "FilteredWords")
+      .withColumnRenamed("result", "Vectors")
+      .withColumnRenamed("prediction", "Predictions")
+
+    println("============================kmeans-5=================================")
+    //predictions.show()
+    println("============================上面是kmeans-pre的结果=================================")
+    //predictions_1.show()
+    println("============================上面是kmeans-pre-1的结果=================================")
+
+
+    println("数量：")
+    //println(predictions.count())
+    println("============================上面是kmeans-pre的数量=================================")
+    //println(predictions_1.count())
+    println("============================上面是kmeans-pre-1的数量=================================")
+    println("聚类预测值")
+    //predictions.show(false)
+    println("============================上面是kmeans的聚类预测值=================================")
+
+
+    println("join之后的结果")
+    //val TimeJoin = EngWordPlusTime.join(predictions, EngWordPlusTime("_c2") === predictions("_1"))
+    val TotalTweetsPlusTime = EngWordPlusTime.unionByName(ChineseWordPlusTime)
+    println("============================join=================================")
+    val TimeJoin = TotalTweetsPlusTime.join(predictions, TotalTweetsPlusTime("_c2") === predictions("Tweets"))
+
+
+    val maxcluster = predictions_1.select("Predictions").rdd
+    println("============================prediction=================================")
+
+    val temp_1 = maxcluster.map(item => {
+      item.mkString
+    })
+
+    val temp_2 = temp_1.map(item => {
+      (item, 1)
+    })
+      .reduceByKey((v1, v2) => {
+        v1 + v2
+      })
+      .reduce((pair1, pair2) => {
+        if (pair1._2 > pair2._2) pair1 else pair2
+      })
+
+    val value = temp_2._1.toInt
+    println("===========================temp=================================")
+    println(temp_2)
+
+    TimeJoin.createOrReplaceTempView("TimeJoin")
+    //val sampletimejoin = spark.sql(s"SELECT _c1 FROM TimeJoin WHERE prediction = $value").rdd
+    val sampletimejoin = spark.sql(s"SELECT _c1 FROM TimeJoin WHERE Predictions = $value").rdd
+
+    /*
+    val SampleTimeJoinRDD = sampletimejoin.map(itr => {
+      itr.mkString
+    }).flatMap(itr=>{
+      itr.split(" ")
+    }).cache()
+     */
+    val SampleTimeJoinRDD = sampletimejoin.map(itr => {
+      itr.mkString
+    }) //.cache()
+
+    SampleTimeJoinRDD.take(5).foreach(println)
+
+    val BiggestClusterTimeRDD = SampleTimeJoinRDD.map(item => {
+      Tuple2(item, 1)
+    })
+
+    val BiggestClusterTime = BiggestClusterTimeRDD.reduceByKey((v1: Int, v2: Int) => {
+      v1 + v2
+    }).toDF().na.drop()
+
+    //BiggestClusterTime.show()
+    println("======================================时间======================================")
+    //BiggestClusterTime.orderBy(desc("_2")).show()
+
+    BiggestClusterTime.coalesce(1)
+      .write
+      .format("csv")
+      .save("G:\\Twitter Election Data Archives\\china\\BiggestClusterTime.csv")
+
+
+    //评分
+
+    val evaluator = new ClusteringEvaluator()
+      .setFeaturesCol("Vectors")
+      .setPredictionCol("Predictions")
+      .setMetricName("silhouette")
+    val silhouette = evaluator.evaluate(predictions)
+    println("============================kmeans的得分=================================")
+    println("得分：" + silhouette)
+
+
+    //统计每个集合的最高频词，用treemap存储
+    println("============================统计词频-1=================================")
+    import scala.collection.mutable.Map
+    val Treemap = Map[String, String]()
+    predictions.createOrReplaceTempView("DFpredictions")
+
+    //因为预设置的分类数是20，所以是0-19遍历
+    //try002 保存每个分区的大小
+    var everySize: Array[Long] = new Array[Long](BestK)
+    //try002 保存每个分区的大小
+    println("============================统计词频-2=================================")
+    for (i <- 0 to BestK - 1) {
+      val dfsub = spark.sql(s"SELECT * FROM DFpredictions WHERE Predictions = $i")
+      println("============================统计词频-2-分区内容和大小=================================")
+      dfsub.show(100, false)
+      //try002
+      everySize(i) = dfsub.count()
+      //try002
+
+      val dfsubrdd = dfsub.select("FilteredWords").rdd
+
+      val value2 = dfsubrdd.map(item => {
+        item.mkString
+      })
+
+      //对推文列每一行进行词频统计
+      //try1
+      //      val Mapcount = value2.map(itr => {
+      //        Tuple2(itr, 1)
+      //      })
+      val Mapcount = value2.flatMap(_.split("[,() ]")).filter(!_.isEmpty).map((_, 1))
+      println("===========================词频统计部分-Map的结果====================")
+      Mapcount.take(20).foreach(println)
+
+      /*try001可以用。再改一下try002试试
+      val Reducecount = Mapcount.reduceByKey((v1: Int, v2: Int) => {
+        v1 + v2
+      }).sortBy(_._2,false).collect
+      println("词频统计部分========词频统计的结果是：")
+      println("=====================================聚类号："+i+"=================================")
+      Reducecount.take(30).foreach(println)
+      println("=====================================聚类号："+i+"的结果=================================")
+      try001改可以用*/
+
+      //try002
+      val Reducecount = Mapcount.reduceByKey((v1: Int, v2: Int) => {
+        v1 + v2
+      }).sortBy(_._2, false).toDF()
+      println("词频统计部分========词频统计的结果是：")
+      println("=====================================聚类号：" + i + "=================================")
+      Reducecount.show(30, false)
+      Reducecount.coalesce(2)
+        .write
+        .format("csv")
+        .save("wordcount===" + i)
+      println("=====================================聚类号：" + i + "的结果=================================")
+      //try002
+
+
+      /*
+      //做一次mapreduce统计每个cluster的词频
+      val Mapcount = value2.map(itr => {
+        Tuple2(itr, 1)
+      })
+      val Reducecount = Mapcount.reduceByKey((v1: Int, v2: Int) => {
+        v1 + v2
+      })
+
+      //通过一次reduce筛选出每个cluster的最高词频及对应的词
+      val MaxCountWord = Reducecount.reduce((pair1, pair2) => {
+        val pair1word = pair1._1.distinct
+        val pair2word = pair2._1.distinct
+        if (pair1word.equals(pair2word)) (pair1word, pair1._2)
+        else {
+          if (pair1._2 < pair2._2) (pair2word, pair2._2) else (pair1word, pair1._2)
+        }
+      })
+
+      //筛选出的每个cluster的最高词频及对应的词存在treemap里
+      Treemap.put(MaxCountWord._1, MaxCountWord._2)
+       */
+    }
+
+
+    println("=============================集群所用的K值和得分为：===========================")
+    println("BestK：" + BestK)
+
+    println("得分：" + silhouette)
+
+
+    println("===========================time取的是哪一个分区=================================")
+    println(temp_2)
+    //try002
+    println("===========================所有cluster的大小=================================")
+    everySize.foreach(println)
+    //try002
+
+
+    spark.stop()
+  }
+}
